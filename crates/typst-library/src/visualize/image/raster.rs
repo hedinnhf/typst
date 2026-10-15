@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::diag::{StrResult, bail};
 use crate::foundations::{Bytes, Cast, Dict, Smart, Value, cast, dict};
@@ -22,7 +22,9 @@ pub struct RasterImage(Arc<RasterImageInner>);
 struct RasterImageInner {
     data: Bytes,
     format: RasterFormat,
-    dynamic: Arc<DynamicImage>,
+    dynamic: OnceLock<Arc<DynamicImage>>,
+    width: u32,
+    height: u32,
     exif_rotation: Option<u32>,
     icc: Option<Bytes>,
     dpi: Option<f64>,
@@ -141,11 +143,20 @@ impl RasterImage {
             }
         };
 
+        let (width, height) = (dynamic.width(), dynamic.height());
+        let pixels = OnceLock::new();
+        // A JPEG is embedded as its own bytes, so its pixels are decoded here
+        // only to validate it and are not kept.
+        if format != RasterFormat::Exchange(ExchangeFormat::Jpg) {
+            let _ = pixels.set(Arc::new(dynamic));
+        }
         Ok(Self(Arc::new(RasterImageInner {
             data,
             format,
             exif_rotation: exif_rot,
-            dynamic: Arc::new(dynamic),
+            dynamic: pixels,
+            width,
+            height,
             icc,
             dpi,
         })))
@@ -163,12 +174,12 @@ impl RasterImage {
 
     /// The image's pixel width.
     pub fn width(&self) -> u32 {
-        self.dynamic().width()
+        self.0.width
     }
 
     /// The image's pixel height.
     pub fn height(&self) -> u32 {
-        self.dynamic().height()
+        self.0.height
     }
 
     /// The EXIF orientation value of the original image.
@@ -188,7 +199,17 @@ impl RasterImage {
 
     /// Access the underlying dynamic image.
     pub fn dynamic(&self) -> &Arc<DynamicImage> {
-        &self.0.dynamic
+        self.0.dynamic.get_or_init(|| {
+            let mut dynamic = image::load_from_memory_with_format(
+                &self.0.data,
+                image::ImageFormat::Jpeg,
+            )
+            .expect("the JPEG decoded when it was loaded");
+            if let Some(rotation) = self.0.exif_rotation {
+                apply_rotation(&mut dynamic, rotation);
+            }
+            Arc::new(dynamic)
+        })
     }
 
     /// Access the ICC profile, if any.
